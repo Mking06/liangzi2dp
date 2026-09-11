@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data & local config (account tokens, API-key hashes, local settings)
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+config.toml
+
+# Backups / scratch
+*.bak
+*.bak.*
+*.bak-*
+*.before-*
+*.before-routing-*
+
+# Node
+node_modules/
+
+# Editor / OS
+.DS_Store
+*.swp

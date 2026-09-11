@@ -1,0 +1,72 @@
+# Liangzidp configuration defaults.
+
+[app]
+app_key = "liangzidp"
+webui_enabled = false
+webui_key = ""
+
+[logging]
+file_level = "INFO"
+max_files = 7
+
+[features]
+temporary = true
+stream = true
+memory = false
+thinking = true
+dynamic_statsig = true
+enable_nsfw = true
+image_format = "url"
+video_format = "url"
+
+[cache]
+image_max_mb = 0
+video_max_mb = 0
+
+[proxy]
+egress_mode = "direct"       # direct | smart
+clearance_mode = "none"      # none | cloudflare | all
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+browser_target = "chrome137"
+skip_ssl_verify = false
+
+[retry]
+reset_session_status_codes = [403]
+max_retries = 1
+on_codes = "429,401,503"
+
+[account]
+refresh.enabled = true
+refresh.basic_interval = 86400
+refresh.super_interval = 7200
+refresh.heavy_interval = 7200
+selection.max_inflight = 1
+selection.strategy = "least_loaded_weighted"
+selection.sticky_ttl_seconds = 3600
+selection.cooldown_seconds = 300
+selection.failure_threshold = 3
+selection.require_pro_tier = false
+identity.retry_ttl_seconds = 30
+queue.max_size = 200
+queue.stream_timeout_seconds = 300
+queue.nonstream_timeout_seconds = 30
+lease.heartbeat_seconds = 15
+lease.stale_seconds = 90
+health.enabled = true
+health.interval_seconds = 120
+health.concurrency = 5
+health.timeout_seconds = 15
+
+[timeouts]
+chat = 60
+image = 60
+video = 60
+voice = 60
+asset = 60
+
+[batch]
+nsfw_concurrency = 50
+refresh_concurrency = 50
+asset_upload_concurrency = 10
+asset_list_concurrency = 50
+asset_delete_concurrency = 50

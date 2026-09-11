@@ -1,0 +1,15 @@
+﻿{
+  "name": "liangzidp-pow-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js microservice wrapper for Liangzidp wasm-bindgen POW solver",
+  "scripts": {
+    "start": "node src/server.js",
+    "smoke": "node src/smoke.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
