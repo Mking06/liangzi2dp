@@ -18,7 +18,10 @@ class ModelInfo:
     pricing: dict | None = None
 
 
-# Model registry
+# Model registry.
+# Liangzidp retired V4 Flash / V4 Flash Vision Exp (and later V4 Pro) upstream;
+# the Web bundle now serves a single engine: Liangzidp V4.1 Flash, exposed as the
+# "default" (快速模式) model_type. All public model IDs therefore route to it.
 MODELS: dict[str, ModelInfo] = {
     "deepseek-v4-flash": ModelInfo(
         id="deepseek-v4-flash",
@@ -29,37 +32,12 @@ MODELS: dict[str, ModelInfo] = {
         supports_tools=True,
         context_length=1_000_000,
     ),
-    "deepseek-v4-pro": ModelInfo(
-        id="deepseek-v4-pro",
-        internal_id="expert",
-        provider="liangzidp",
-        supports_thinking=True,
-        supports_vision=True,
-        supports_tools=True,
-        context_length=1_000_000,
-    ),
-    "deepseek-v4-vision": ModelInfo(
-        id="deepseek-v4-vision",
-        internal_id="vision",
-        provider="liangzidp",
-        supports_thinking=True,
-        supports_vision=True,
-        supports_tools=True,
-        context_length=1_000_000,
-    ),
-    "deepseek-v4-flash-vision-exp": ModelInfo(
-        id="deepseek-v4-flash-vision-exp",
-        internal_id="vision",
-        provider="liangzidp",
-        supports_thinking=True,
-        supports_vision=True,
-        supports_tools=True,
-        context_length=1_000_000,
-    ),
 }
 
-# Aliases
-MODEL_ALIASES: dict[str, str] = {}
+# Aliases: the official new API name "deepseek-flash" maps to the same engine.
+MODEL_ALIASES: dict[str, str] = {
+    "deepseek-flash": "deepseek-v4-flash",
+}
 
 
 def get_model_info(model_id: str) -> ModelInfo | None:

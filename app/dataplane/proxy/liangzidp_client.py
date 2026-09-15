@@ -178,6 +178,7 @@ class LiangzidpAPIError(Exception):
 
     def from_response(cls, resp) -> "LiangzidpAPIError":
 
+        data = None
         try:
 
             data = resp.json()
@@ -192,6 +193,18 @@ class LiangzidpAPIError(Exception):
 
             code = "api_error"
 
+        # Liangzidp wraps account-level rejection (e.g. biz_code=5 muted) inside
+        # an envelope: {"code":0,"data":{"biz_code":5,"biz_msg":...}}. Surface it
+        # as a distinct account-level code so the orchestrator can cool + fail over.
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            inner = data["data"]
+            biz_code = inner.get("biz_code")
+            biz_msg = str(inner.get("biz_msg") or "")
+            joined = f"{msg} {biz_msg}".lower()
+            if str(biz_code) == "5" or "muted" in joined or "禁言" in joined:
+                code = "account_muted"
+                if biz_msg and biz_msg not in str(msg):
+                    msg = f"{msg} biz_msg={biz_msg}"
         return cls.normalized(str(msg), resp.status_code, str(code))
 
 
@@ -291,6 +304,15 @@ class LiangzidpAPIError(Exception):
         ):
 
             return cls(message, 409, "session_state_invalid")
+
+        if any(
+            marker in lowered
+            for marker in ("user is muted", "is muted", "muted", "禁言", "账号已被禁")
+        ):
+            # Liangzidp web risk-control: the whole account is muted/banned from
+            # chatting (biz_code=5). Account-level, not quota or a client 4xx, so
+            # the orchestrator cools it down long and fails over to another.
+            return cls(message, 403, "account_muted")
 
         return cls(message, status_code, code)
 
@@ -702,13 +724,21 @@ class LiangzidpClient:
 
                         )
 
+                        biz_kind = (
+
+                            "account_muted" if str(biz_code) == "5" else "chat_error"
+
+                        )
+
+                        biz_status = 403 if str(biz_code) == "5" else 500
+
                         raise LiangzidpAPIError.normalized(
 
                             message,
 
-                            500,
+                            biz_status,
 
-                            "chat_error",
+                            biz_kind,
 
                         )
 
@@ -1043,6 +1073,36 @@ class LiangzidpClient:
 
 
 
+        idle_seconds = max(
+
+            30, int(os.getenv("LIANGZIDP_STREAM_IDLE_SECONDS", "120"))
+
+        )
+
+        async def get_next():
+
+            try:
+
+                return await asyncio.wait_for(
+
+                    asyncio.to_thread(bridge.get), timeout=idle_seconds
+
+                )
+
+            except TimeoutError:
+
+                stop_worker.set()
+
+                raise LiangzidpAPIError(
+
+                    "Upstream stream stalled (no data within idle window)",
+
+                    504,
+
+                    "stream_idle_timeout",
+
+                )
+
         try:
 
             role_metadata = {
@@ -1051,13 +1111,37 @@ class LiangzidpClient:
 
             }
 
+            # Block until the worker reports upstream status BEFORE emitting the
+
+            # first frame, so account-level start errors (muted / 429 / 5xx) surface
+
+            # here before any downstream byte and the reverse layer can fail over.
+
+            first_kind, first_value = await get_next()
+
+            if first_kind == "error":
+
+                raise first_value
+
+            pending: list[tuple[str, Any]] = []
+
+            if first_kind != "ready":
+
+                pending.append((first_kind, first_value))
+
             yield chunk({"role": "assistant"}, liangzidp=role_metadata)
 
             done = False
 
             while not done:
 
-                kind, value = await asyncio.to_thread(bridge.get)
+                if pending:
+
+                    kind, value = pending.pop(0)
+
+                else:
+
+                    kind, value = await get_next()
 
                 if kind == "error":
 

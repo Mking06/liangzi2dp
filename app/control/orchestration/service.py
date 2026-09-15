@@ -931,8 +931,21 @@ class SessionOrchestrator:
             success = None
         cooldown = config.get_int("account.selection.cooldown_seconds", 300) if success is False else 0
         threshold = config.get_int("account.selection.failure_threshold", 3)
-        if error_kind in {"rate_limit", "invalid_token"} or "rate limit" in error.lower():
+        # Account-level / transport failures cool down immediately (threshold 1)
+        # with a kind-specific duration, so a muted/limited/stalled account stops
+        # absorbing traffic instead of being retried every cooldown window.
+        if error_kind == "account_muted":
             threshold = 1
+            cooldown = config.get_int("account.selection.muted_cooldown_seconds", 10800)
+        elif error_kind == "invalid_token":
+            threshold = 1
+            cooldown = config.get_int("account.selection.invalid_cooldown_seconds", 3600)
+        elif error_kind == "rate_limit" or "rate limit" in error.lower():
+            threshold = 1
+            cooldown = config.get_int("account.selection.rate_limit_cooldown_seconds", cooldown)
+        elif error_kind == "stream_idle":
+            threshold = 1
+            cooldown = config.get_int("account.selection.stall_cooldown_seconds", 30)
         await self.store.release_slot(
             lease.account.id,
             success=success,

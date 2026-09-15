@@ -49,30 +49,45 @@ from app.platform.logging.logger import logger
 
 
 LIANGZIDP_ERROR_KINDS = {
-
     "invalid_api_key": "invalid_token",
-
     "rate_limit_exceeded": "rate_limit",
-
     "invalid_pow": "invalid_pow",
-
     "incomplete_stream": "incomplete_stream",
-
     "upstream_busy": "upstream_busy",
-
     "context_length_exceeded": "context_length",
-
     "parallel_chat_limit": "account_busy",
-
     "session_state_invalid": "session_state",
-
     "pow_service_unavailable": "pow_infrastructure",
-
     "pow_solver_error": "pow_infrastructure",
-
     "pow_solver_no_answer": "pow_infrastructure",
-
+    "account_muted": "account_muted",
+    "stream_idle_timeout": "stream_idle",
 }
+
+# Kinds that mean "this account cannot serve this request right now": cool it
+# down and, before any downstream byte is produced, try another account. The
+# outer failover loop in chat_completion bounds how many accounts are tried.
+ACCOUNT_FAILOVER_KINDS = {
+    "account_muted",
+    "rate_limit",
+    "invalid_token",
+    "account_busy",
+    "stream_idle",
+    "incomplete_stream",
+}
+
+# Generic upstream HTTP statuses that also justify switching account.
+FAILOVER_UPSTREAM_STATUSES = {500, 502, 503, 504}
+
+
+class _SwitchAccount(Exception):
+    """Internal signal: release/cooldown done; outer loop should switch account."""
+
+    def __init__(self, account_id: str, kind: str, exc: Exception):
+        self.account_id = account_id
+        self.kind = kind
+        self.exc = exc
+        super().__init__(f"switch away from {account_id} after {kind}")
 
 
 
@@ -177,65 +192,96 @@ class ReverseProxy:
 
 
     async def chat_completion(
-
         self,
-
         request_data: dict[str, Any],
-
         account_id: str | None = None,
-
         pow_response: str = "",
-
         proxy: str | None = None,
-
         repository: Any | None = None,
-
         orchestrator: Any | None = None,
-
     ) -> dict | AsyncGenerator[str, None]:
-
-        """Handle a chat completion request."""
-
+        """Handle a chat completion request with bounded cross-account failover."""
         from app.control.account.backends.factory import create_repository
 
-
-
         repo = repository or create_repository()
-
         if repository is None:
-
             await repo.initialize()
-
-
-
         if orchestrator is None:
-
             raise AccountError(
-
                 "Session orchestrator unavailable", 503, "orchestrator_unavailable"
-
             )
-
-
-
-        lease = await orchestrator.acquire(
-
-            repo,
-
-            request_data,
-
-            requested_account_id=account_id,
-
-            egress_proxy=proxy or "",
-
+        max_attempts = max(
+            1,
+            min(int(os.getenv("LIANGZIDP_ACCOUNT_FAILOVER_ATTEMPTS", "5")), 6),
         )
+        tried: set[str] = set()
+        attempt_no = 0
+        try:
+            while True:
+                attempt_no += 1
+                try:
+                    return await self._chat_attempt(
+                        request_data,
+                        repo=repo,
+                        orchestrator=orchestrator,
+                        requested_account_id=account_id,
+                        egress_proxy=proxy or "",
+                        pow_response=pow_response,
+                        excluded=tried,
+                        allow_failover=not account_id,
+                        attempt_no=attempt_no,
+                        max_attempts=max_attempts,
+                    )
+                except _SwitchAccount as switch:
+                    tried.add(switch.account_id)
+                    await orchestrator.store.increment_metric("account_failovers")
+                    if attempt_no >= max_attempts:
+                        logger.warning(
+                            "account failover exhausted: tried={} last_kind={}",
+                            sorted(tried),
+                            switch.kind,
+                        )
+                        if isinstance(
+                            switch.exc, (LiangzidpAPIError, AccountError, ProxyError)
+                        ):
+                            raise switch.exc
+                        raise ProxyError(str(switch.exc)) from switch.exc
+                    logger.warning(
+                        "failing over to another account: failed={} kind={} attempt={}/{}",
+                        switch.account_id,
+                        switch.kind,
+                        attempt_no,
+                        max_attempts,
+                    )
+                    continue
+        finally:
+            if repository is None:
+                await repo.close()
 
+    async def _chat_attempt(
+        self,
+        request_data: dict[str, Any],
+        *,
+        repo: Any,
+        orchestrator: Any,
+        requested_account_id: str | None,
+        egress_proxy: str,
+        pow_response: str,
+        excluded: set[str],
+        allow_failover: bool,
+        attempt_no: int,
+        max_attempts: int,
+    ) -> dict | AsyncGenerator[str, None]:
+        lease = await orchestrator.acquire(
+            repo,
+            request_data,
+            requested_account_id=requested_account_id,
+            excluded=excluded,
+            egress_proxy=egress_proxy,
+        )
         if lease is None:
-
             raise AccountError("No available accounts", 503)
-
         account_data = lease.raw
-
         account_id = lease.account.id
 
         session_token = account_data.get("session_token") or account_data.get(
@@ -274,7 +320,7 @@ class ReverseProxy:
 
             pow_response=pow_response,
 
-            proxy=lease.egress_proxy or proxy or "",
+            proxy=lease.egress_proxy or egress_proxy or "",
 
             timeout=int(os.getenv("LIANGZIDP_CHAT_TIMEOUT", "300")),
 
@@ -396,11 +442,21 @@ class ReverseProxy:
 
                     await repo.upsert(account_data)
 
+                if self._should_failover(error_kind, exc, allow_failover):
+
+                    raise _SwitchAccount(account_id, error_kind, exc)
+
+                if error_kind == "invalid_token":
+
                     raise AccountError(
 
                         "Session expired", 401, "invalid_api_key"
 
                     ) from exc
+
+                raise
+
+            except _SwitchAccount:
 
                 raise
 
@@ -417,6 +473,10 @@ class ReverseProxy:
                     error_kind="upstream_error",
 
                 )
+
+                if allow_failover:
+
+                    raise _SwitchAccount(account_id, "upstream_error", exc)
 
                 raise ProxyError(str(exc)) from exc
 
@@ -636,6 +696,42 @@ class ReverseProxy:
 
                         )
 
+            if not isinstance(result, dict):
+
+                # The stream generator has not touched the network yet. Prime its
+
+                # first frame so account-level start errors surface here, before
+
+                # any downstream byte, and can trigger cross-account failover;
+
+                # once a real frame is produced we never retry mid-stream.
+
+                try:
+
+                    first_frame = await result.__anext__()
+
+                except StopAsyncIteration:
+
+                    first_frame = None
+
+                except Exception:
+
+                    await result.aclose()
+
+                    raise
+
+                async def _prepended_stream(_gen=result, _first=first_frame):
+
+                    if _first is not None:
+
+                        yield _first
+
+                    async for _part in _gen:
+
+                        yield _part
+
+                result = _prepended_stream()
+
             if isinstance(result, dict):
 
                 await self._commit_orchestration_result(
@@ -768,6 +864,10 @@ class ReverseProxy:
 
                 await repo.upsert(account_data)
 
+            if self._should_failover(error_kind, exc, allow_failover):
+
+                raise _SwitchAccount(account_id, error_kind, exc)
+
             if exc.status_code == 401 or "INVALID_TOKEN" in exc.message:
 
                 logger.warning("session expired: account={}", account_id)
@@ -777,6 +877,10 @@ class ReverseProxy:
             elif exc.code == "invalid_pow" or "INVALID_POW" in exc.message:
 
                 raise AccountError("POW challenge failed", 403, "invalid_pow")
+
+            raise
+
+        except _SwitchAccount:
 
             raise
 
@@ -796,13 +900,12 @@ class ReverseProxy:
 
             logger.error("proxy error: error={}", exc)
 
+            if allow_failover:
+
+                raise _SwitchAccount(account_id, "upstream_error", exc)
+
             raise ProxyError(str(exc))
 
-        finally:
-
-            if repository is None:
-
-                await repo.close()
 
 
 
@@ -1131,6 +1234,24 @@ class ReverseProxy:
             return LIANGZIDP_ERROR_KINDS.get(exc.code, "upstream_error")
 
         return "upstream_error"
+
+    @staticmethod
+
+    def _should_failover(kind: str, exc: Exception, allow_failover: bool) -> bool:
+
+        if not allow_failover:
+
+            return False
+
+        if kind in ACCOUNT_FAILOVER_KINDS:
+
+            return True
+
+        if kind == "upstream_error" and isinstance(exc, LiangzidpAPIError):
+
+            return int(getattr(exc, "status_code", 0) or 0) in FAILOVER_UPSTREAM_STATUSES
+
+        return False
 
 
 
